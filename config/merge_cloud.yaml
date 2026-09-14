@@ -1,0 +1,27 @@
+merge_cloud_node:
+  ros__parameters:
+    cloud1_topic: /odin1_/cloud_slam
+    cloud2_topic: /livox/lidar/pointcloud
+    frame_id: front_odin1
+    odom_topic: /odin1_/odometry_highfreq
+
+    roll1: 0.0
+    pitch1: 0.0
+    yaw1: 0.0
+    tx1: 0.02
+    ty1: 0.03447
+    tz1: 0.02174
+    # cloud2 -> cloud1 extrinsic
+    roll2: 0.5236
+    pitch2: 0.0
+    yaw2: -1.5708
+    tx2: -0.31436
+    ty2: 0.0165
+    tz2: 0.0373
+
+    blind_sphere_enable: true
+    blind_sphere_radius: 0.3
+    blind_sphere_cx: 0.0
+    blind_sphere_cy: 0.0
+    blind_sphere_cz: 0.0
+    blind_sphere_follow_odom: true
