@@ -20,7 +20,7 @@ public:
   {
     this->declare_parameter<std::string>("cloud1_topic", "/odin1_/cloud_raw");
     this->declare_parameter<std::string>("cloud2_topic", "/livox/lidar/pointcloud");
-    this->declare_parameter<std::string>("frame_id", "front_odin1");
+    this->declare_parameter<std::string>("frame_id", "odin1");
     this->declare_parameter<std::string>("odom_topic", "/odin1_/odometry_highfreq");
     this->declare_parameter<double>("crop_half_size", 5.0);
 
@@ -71,6 +71,12 @@ public:
     this->get_parameter("blind_sphere_cy", blind_sphere_cy_);
     this->get_parameter("blind_sphere_cz", blind_sphere_cz_);
     this->get_parameter("blind_sphere_follow_odom", blind_sphere_follow_odom_);
+
+    if (!blind_sphere_follow_odom_) {
+      RCLCPP_WARN(get_logger(),
+                  "blind_sphere_follow_odom=false has no effect: the merged cloud is already in "
+                  "the robot-centred Odin1 frame, so the blind sphere always follows the robot");
+    }
 
     cloud1_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       cloud1_topic_, rclcpp::SensorDataQoS(),
@@ -181,10 +187,17 @@ private:
     if (cloud1_msg) {
       pcl::transformPointCloud(*cloud1, *cloud1, cloud1_static);
     }
-    pcl::transformPointCloud(*cloud2, *cloud2, cloud1_static * cloud2_static);
 
-    // ---- deskew cloud2 using odometry (now in body frame) ----
+    // ---- cloud2 chain: cloud2 frame -> Odin1 frame -> (deskew) -> output frame ----
+    pcl::transformPointCloud(*cloud2, *cloud2, cloud2_static);
+
+    // ---- deskew cloud2 using odometry ----
+    // Motion compensation only: every point is brought back to the scan-start pose, so the
+    // cloud stays in the Odin1 frame -- the frame this odometry is expressed in.
     deskewCloud(*cloud2_msg, *cloud2, cloud2_stamp, odom_snapshot);
+
+    // Odin1 frame -> output frame
+    pcl::transformPointCloud(*cloud2, *cloud2, cloud1_static);
 
     pcl::PointCloud<pcl::PointXYZI>::Ptr merged(new pcl::PointCloud<pcl::PointXYZI>);
     if (cloud1_msg) {
@@ -193,21 +206,16 @@ private:
       *merged = *cloud2;
     }
 
+    // The merged cloud is in the Odin1 frame, which already travels with the robot, so the
+    // crop box and the blind sphere are anchored at the origin rather than at the odometry
+    // position (which would be a world coordinate and no longer meaningful here).
     const float half_size = static_cast<float>(crop_half_size_);
-    float cx = 0.0f;
-    float cy = 0.0f;
-    float cz = 0.0f;
-    if (!odom_snapshot.empty()) {
-      const auto& latest = odom_snapshot.back();
-      cx = latest.pos.x();
-      cy = latest.pos.y();
-      cz = latest.pos.z();
-    }
+    const float cx = 0.0f;
+    const float cy = 0.0f;
 
-    // blind sphere center follows odometry
-    const float bs_cx = blind_sphere_follow_odom_ ? cx + blind_sphere_cx_ : blind_sphere_cx_;
-    const float bs_cy = blind_sphere_follow_odom_ ? cy + blind_sphere_cy_ : blind_sphere_cy_;
-    const float bs_cz = blind_sphere_follow_odom_ ? cz + blind_sphere_cz_ : blind_sphere_cz_;
+    const float bs_cx = static_cast<float>(blind_sphere_cx_);
+    const float bs_cy = static_cast<float>(blind_sphere_cy_);
+    const float bs_cz = static_cast<float>(blind_sphere_cz_);
     const float bs_r2 = blind_sphere_radius_ * blind_sphere_radius_;
 
     pcl::PointCloud<pcl::PointXYZI>::Ptr cropped(new pcl::PointCloud<pcl::PointXYZI>);
@@ -284,16 +292,6 @@ private:
     return true;
   }
 
-  static Eigen::Matrix4f poseToMatrix(const OdomPose& pose)
-  {
-    Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
-    T.block<3,3>(0,0) = pose.rot.toRotationMatrix();
-    T(0,3) = pose.pos.x();
-    T(1,3) = pose.pos.y();
-    T(2,3) = pose.pos.z();
-    return T;
-  }
-
   bool findPerPointTimeField(const sensor_msgs::msg::PointCloud2& msg,
                              std::string& field_name) const
   {
@@ -313,6 +311,16 @@ private:
   {
     if (odom_buffer.size() < 2 || cloud.empty()) return;
 
+    // Reference pose: every point is compensated back to the scan start, which keeps the
+    // result in the Odin1 frame instead of pushing it out into the odometry world frame.
+    OdomPose odom_ref;
+    if (!interpolateOdom(scan_start, odom_buffer, odom_ref)) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "deskew: no odometry at scan start, skipping motion compensation");
+      return;
+    }
+    const Eigen::Matrix3f r_ref_inv = odom_ref.rot.conjugate().toRotationMatrix();
+
     std::string time_field;
     const bool has_time = findPerPointTimeField(msg, time_field);
 
@@ -330,8 +338,8 @@ private:
         OdomPose odom_pt;
         if (!interpolateOdom(pt_stamp, odom_buffer, odom_pt)) continue;
 
-        // p_world = T_world_body(t_point) * p_body
-        applyTransform(cloud, i, poseToMatrix(odom_pt));
+        // p_ref = T_world(t_ref)^-1 * T_world(t_point) * p
+        applyRelative(cloud, i, r_ref_inv, odom_ref.pos, odom_pt);
       }
     } else {
       const size_t n = cloud.size();
@@ -346,21 +354,25 @@ private:
         OdomPose odom_pt;
         if (!interpolateOdom(pt_stamp, odom_buffer, odom_pt)) continue;
 
-        applyTransform(cloud, i, poseToMatrix(odom_pt));
+        applyRelative(cloud, i, r_ref_inv, odom_ref.pos, odom_pt);
       }
     }
   }
 
-  // p_world = T * p
-  void applyTransform(pcl::PointCloud<pcl::PointXYZI>& cloud, size_t idx,
-                      const Eigen::Matrix4f& T) const
+  // p_ref = T_ref^-1 * T_pt * p = R_ref^T*R_pt*p + R_ref^T*(t_pt - t_ref)
+  void applyRelative(pcl::PointCloud<pcl::PointXYZI>& cloud, size_t idx,
+                     const Eigen::Matrix3f& r_ref_inv,
+                     const Eigen::Vector3f& ref_pos,
+                     const OdomPose& pt_pose) const
   {
+    const Eigen::Matrix3f R = r_ref_inv * pt_pose.rot.toRotationMatrix();
+    const Eigen::Vector3f t = r_ref_inv * (pt_pose.pos - ref_pos);
     auto& pt = cloud[idx];
-    Eigen::Vector3f p(pt.x, pt.y, pt.z);
-    Eigen::Vector3f pw = T.block<3,3>(0,0) * p + T.block<3,1>(0,3);
-    pt.x = pw.x();
-    pt.y = pw.y();
-    pt.z = pw.z();
+    const Eigen::Vector3f p(pt.x, pt.y, pt.z);
+    const Eigen::Vector3f pr = R * p + t;
+    pt.x = pr.x();
+    pt.y = pr.y();
+    pt.z = pr.z();
   }
 
   // ---- existing helpers ----
