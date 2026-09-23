@@ -2,8 +2,7 @@
 
 把两路激光雷达（Odin1 + Livox）的点云标定对齐、运动补偿、裁剪切块后合成一路输出。
 
-输入是 Odin1 的主点云和 Livox 的原始点云，输出是单帧的 `/merged_cloud`。节点由 Livox 帧驱动，
-**输出频率等于 Livox 的帧率**。
+输入是 Odin1 的主点云和 Livox 的原始点云，输出是单帧的 `/merged_cloud`。
 
 ## 目录结构
 
@@ -16,13 +15,85 @@ merge_cloud/
 └── src/merge_cloud_code.cpp      # 单文件实现，全部逻辑在 MergeCloudNode 类里
 ```
 
-## 依赖与构建
+## 依赖与安装
 
-ROS 2（开发环境为 Humble），`ament_cmake`。除标准消息包外依赖 `pcl_ros` / `pcl_conversions` 和
-`livox_ros_driver2`。
+环境：**Ubuntu 22.04 + ROS 2 Humble**，构建类型 `ament_cmake`。
+
+### 1. ROS 2 Humble
+
+若尚未安装，按官方文档装 `ros-humble-desktop` 或 `ros-humble-ros-base`：
+<https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html>
+
+### 2. 本包依赖
+
+全部都在 apt 里，一条命令装完：
 
 ```bash
-# 需要先 source 一个包含 livox_ros_driver2 的 workspace
+sudo apt update
+sudo apt install -y \
+  ros-humble-pcl-ros \
+  ros-humble-pcl-conversions \
+  ros-humble-tf2-ros \
+  ros-humble-rclcpp \
+  ros-humble-sensor-msgs \
+  ros-humble-nav-msgs \
+  ros-humble-geometry-msgs \
+  ros-humble-launch \
+  ros-humble-launch-ros \
+  libeigen3-dev
+```
+
+`libpcl-dev` 会作为 `ros-humble-pcl-ros` 的依赖自动装上（Humble 对应 PCL 1.12）。
+
+如果你的包放在一个 colcon workspace 里，也可以让 rosdep 照 `package.xml` 解析全部依赖：
+
+```bash
+sudo rosdep init && rosdep update    # 只需首次执行
+cd ~/ros2_ws
+rosdep install --from-paths src --ignore-src -r -y
+```
+
+### 3. livox_ros_driver2（可选）
+
+apt 里没有这个包，需要源码编译。这里有一个容易漏掉的前置依赖：**必须先编译安装 Livox-SDK2**。
+驱动包的 `CMakeLists.txt` 是直接从 `/usr/local/lib` 找 `liblivox_lidar_sdk_static.a` 的
+（`find_library(... /usr/local/lib)`），并不会通过 git submodule 自动拉取 SDK。
+
+```bash
+# ① 先装 Livox-SDK2，它会安装到 /usr/local
+git clone https://github.com/Livox-SDK/Livox-SDK2.git
+cd Livox-SDK2
+mkdir -p build && cd build
+cmake .. && make -j$(nproc)
+sudo make install
+
+# ② 再编译驱动包，注意必须放在 workspace 的 src/ 下
+mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
+git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+cd livox_ros_driver2
+./build.sh humble      # 该仓库自带的构建脚本，参数填 ROS 发行版名
+```
+
+编译完成后从它所在的 workspace source 出环境即可。
+
+> **实际上可以不装。** `merge_cloud_code.cpp` 没有 include 任何 livox 头文件——源码里唯一出现的
+> "livox" 是默认话题名 `/livox/lidar/pointcloud`。`livox_ros_driver2` 只出现在
+> `CMakeLists.txt` 的 `find_package` / `ament_target_dependencies` 和 `package.xml` 的 `<depend>` 中，
+> 编译本节点并不需要它。若不想引入这个依赖，把这 3 处删掉即可：驱动是独立节点，与本包只通过
+> 话题交互。
+
+### 4. 验证依赖就位
+
+```bash
+ros2 pkg prefix pcl_ros
+ros2 pkg prefix livox_ros_driver2    # 若按上面的说明跳过则忽略这条
+```
+
+## 构建与运行
+
+在包含 `merge_cloud` 的 colcon workspace 根目录下：
+
+```bash
 colcon build --packages-select merge_cloud
 source install/setup.bash
 ros2 launch merge_cloud merge_cloud.launch.py
@@ -103,23 +174,6 @@ cloud2:  p₂  --T₂-->  Odin1 系（各点各自采集时刻）
 逐点时刻优先读点云里的 `timestamp` / `time` / `t` 字段（按 **uint32 纳秒偏移**解析）；读不到就退化为
 「假设扫描时长 0.1 s，按点序号线性均分」。位姿在 odom 缓冲里做线性插值 + 四元数 slerp。
 
-## 坐标系约定
-
-**输出点云在 Odin1 系**（机器人系），不是世界系。因此：
-
-- 裁剪盒和盲区球以**原点**为中心，天然跟随机器人
-- `header.frame_id` 标为 `front_odin1`，与点云实际所处坐标系一致
-- `header.stamp` 是扫描参考时刻，与该帧点位姿一致
-
-## 已知限制
-
-- **拼接是纯 append**，没有配准、没有重叠区去重。两雷达共同视野内的物体会出现两次，重叠区点密度翻倍，下游做聚类/平面拟合时注意阈值。
-- **外参是手填的**，代码不会自动纠正偏差。误差 1° 在 5 m 处就是 8.7 cm 的双影。
-- **时间配对没有容差校验**，也没有按时间淘汰。若 `cloud1_topic` 中断，最后一帧 cloud1 会被无限期拿去和后续每一帧合并。
-- **cloud1 缓存只按帧数淘汰**（50 帧），不按时间。
-- **两路点云的 intensity 语义可能不同**却塞进同一个字段：cloud1 若带 `rgb`/`rgba`/分离 RGB 字段会被转成 0~255 灰度，否则回退到自己的 `intensity`；cloud2 用 Livox 原始 `intensity`。两者语义不同时，下游按强度着色或阈值过滤会看到两片不一致。
-- **每点时间字段按 uint32 解析**，只校验字段名不校验类型。若话题实际发布的是 float64，会抛异常；若是绝对时间而非偏移，会被静默钳位到 1 s。
-- 回调都在默认的互斥回调组里，`MultiThreadedExecutor` 实际是串行的。
 
 ## 调试
 
@@ -131,6 +185,3 @@ ros2 topic echo --once /odin1_/cloud_slam --field header.frame_id
 ros2 topic hz /merged_cloud
 ros2 topic echo --once /merged_cloud --field header
 ```
-
-RViz 里把 Fixed Frame 设为 `front_odin1`：两路点云应当紧贴机器人、随其移动且互相刚性咬合。
-若 cloud2 扫出去钉在场景里不动，说明去畸变把点推到了世界系（本轮改动前的行为）。
